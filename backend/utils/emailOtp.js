@@ -31,7 +31,7 @@ export const requestEmailOtp = async ({ email, purpose }) => {
     email: normalizedEmail,
     purpose,
     codeHash,
-    expireAt,
+    expiresAt,
   });
 
   await sendOtpNotification({ email: normalizedEmail, code, purpose });
