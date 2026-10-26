@@ -119,7 +119,7 @@ export const verifyRegistrationOTP = async (req, res) => {
     }
     const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
-      return res.status(400).json({ message: "Email already exists." });
+      return res.status(409).json({ message: "Email already exists." });
     }
     const otpResult = await verifyEmailOtp({
       email: normalizedEmail,
