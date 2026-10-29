@@ -38,8 +38,8 @@ const toPublicBusiness = (business) => ({
 // Hold a slot for 30 minutes while payment is pending.
 const holdWindowStart = () => new Date(Date.now() - 30 * 60 * 1000);
 
-const findActiveSlotBookings = ({ userId, date }) => {
-  return Booking.find({
+const findActiveSlotBookings = ({ userId, date, session }) => {
+  const query = Booking.find({
     userId,
     date,
     $or: [
@@ -50,6 +50,64 @@ const findActiveSlotBookings = ({ userId, date }) => {
       },
     ],
   });
+
+  return session ? query.session(session) : query;
+};
+
+// All slot reservations and paid-booking confirmations for a business write
+// this same document in their transaction. MongoDB retries conflicting
+// transactions, so the next transaction checks against the committed booking.
+const acquireBookingReservationLock = async ({ businessId, session }) => {
+  const result = await User.updateOne(
+    { _id: businessId },
+    { $inc: { bookingReservationVersion: 1 } },
+    { session, strict: false },
+  );
+
+  if (result.matchedCount === 0) {
+    throw new Error("Booking business was not found.");
+  }
+};
+
+const reserveBookingSlot = async ({
+  businessId,
+  date,
+  startTime,
+  endTime,
+  bookingData,
+}) => {
+  const session = await mongoose.startSession();
+  let booking;
+
+  try {
+    await session.withTransaction(async () => {
+      booking = null;
+
+      await acquireBookingReservationLock({ businessId, session });
+
+      const activeBookings = await findActiveSlotBookings({
+        userId: businessId,
+        date,
+        session,
+      });
+
+      const hasConflict = activeBookings.some((candidate) =>
+        timeOverlap(startTime, endTime, candidate.startTime, candidate.endTime),
+      );
+
+      if (hasConflict) {
+        const error = new Error("That slot is no longer available.");
+        error.code = "SLOT_CONFLICT";
+        throw error;
+      }
+
+      [booking] = await Booking.create([bookingData], { session });
+    });
+
+    return booking;
+  } finally {
+    await session.endSession();
+  }
 };
 
 // --------------------------------------------------
@@ -292,22 +350,6 @@ export const createPublicBooking = async (req, res) => {
       });
     }
 
-    // Check whether the requested slot is still available.
-    const bookings = await findActiveSlotBookings({
-      userId: business._id,
-      date,
-    });
-
-    const hasConflict = bookings.some((booking) =>
-      timeOverlap(startTime, endTime, booking.startTime, booking.endTime),
-    );
-
-    if (hasConflict) {
-      return res.status(409).json({
-        message: "That slot is no longer available.",
-      });
-    }
-
     // Convert service price from rupees to paise.
     // Razorpay expects amounts in the smallest currency unit.
     const amount = toRazorpayAmount(service.price);
@@ -359,25 +401,31 @@ export const createPublicBooking = async (req, res) => {
       },
     });
 
-    // Create the booking first.
-    createdBooking = await Booking.create({
-      userId: business._id,
-      serviceId,
-      customerName: normalizedCustomerName,
-      customerEmail: normalizedCustomerEmail,
-      customerAvatar: customerAvatar || "A1.png",
+    // Reserve the slot and create the booking in one serialized transaction.
+    createdBooking = await reserveBookingSlot({
+      businessId: business._id,
       date,
       startTime,
       endTime,
-      notes: notes || "",
-      amount,
-      platformFeeAmount,
-      providerPayoutAmount,
-      payoutStatus: amount > 0 ? "pending" : "not_required",
-      currency,
-      paymentStatus: amount > 0 ? "pending" : "not_required",
-      status: amount > 0 ? "pending_payment" : "confirmed",
-      customerCalendarUrl,
+      bookingData: {
+        userId: business._id,
+        serviceId,
+        customerName: normalizedCustomerName,
+        customerEmail: normalizedCustomerEmail,
+        customerAvatar: customerAvatar || "A1.png",
+        date,
+        startTime,
+        endTime,
+        notes: notes || "",
+        amount,
+        platformFeeAmount,
+        providerPayoutAmount,
+        payoutStatus: amount > 0 ? "pending" : "not_required",
+        currency,
+        paymentStatus: amount > 0 ? "pending" : "not_required",
+        status: amount > 0 ? "pending_payment" : "confirmed",
+        customerCalendarUrl,
+      },
     });
 
     // Free bookings do not require a Razorpay order.
@@ -448,6 +496,10 @@ export const createPublicBooking = async (req, res) => {
       customerEmail: normalizedCustomerEmail,
     });
   } catch (error) {
+    if (error.code === "SLOT_CONFLICT") {
+      return res.status(409).json({ message: error.message });
+    }
+
     // If order creation fails, release the slot by failing the pending booking.
     if (
       createdBooking &&
@@ -479,55 +531,99 @@ export const createPublicBooking = async (req, res) => {
 // --------------------------------------------------
 
 const confirmPaidBooking = async ({ booking, business, service }) => {
-  if (booking.status === "confirmed" && booking.paymentStatus === "paid") {
-    return booking;
+  const paymentId = booking.razorpayPaymentId;
+  const session = await mongoose.startSession();
+  let currentBooking;
+  let slotConflict = false;
+  let alreadyConfirmed = false;
+
+  try {
+    await session.withTransaction(async () => {
+      currentBooking = null;
+      slotConflict = false;
+      alreadyConfirmed = false;
+
+      await acquireBookingReservationLock({
+        businessId: booking.userId,
+        session,
+      });
+
+      currentBooking = await Booking.findById(booking._id).session(session);
+
+      if (!currentBooking) {
+        throw new Error("Booking not found.");
+      }
+
+      if (
+        currentBooking.status === "confirmed" &&
+        currentBooking.paymentStatus === "paid"
+      ) {
+        alreadyConfirmed = true;
+        return;
+      }
+
+      const confirmedBookings = await Booking.find({
+        _id: { $ne: currentBooking._id },
+        userId: currentBooking.userId,
+        date: currentBooking.date,
+        status: "confirmed",
+      }).session(session);
+
+      const hasConflict = confirmedBookings.some((candidate) =>
+        timeOverlap(
+          currentBooking.startTime,
+          currentBooking.endTime,
+          candidate.startTime,
+          candidate.endTime,
+        ),
+      );
+
+      currentBooking.razorpayPaymentId = paymentId;
+
+      if (hasConflict) {
+        currentBooking.status = "payment_failed";
+        currentBooking.paymentStatus = "failed";
+        await currentBooking.save({ session });
+        slotConflict = true;
+        return;
+      }
+
+      currentBooking.status = "confirmed";
+      currentBooking.paymentStatus = "paid";
+      currentBooking.payoutStatus =
+        currentBooking.providerPayoutAmount > 0 ? "available" : "not_required";
+
+      await currentBooking.save({ session });
+    });
+  } finally {
+    await session.endSession();
   }
 
-  // Check again in case another booking was confirmed in the meantime.
-  const conflictingBookings = await Booking.find({
-    _id: { $ne: booking._id },
-    userId: booking.userId,
-    date: booking.date,
-    status: "confirmed",
-  });
-
-  const hasConflict = conflictingBookings.some((candidate) =>
-    timeOverlap(
-      booking.startTime,
-      booking.endTime,
-      candidate.startTime,
-      candidate.endTime,
-    ),
-  );
-
-  if (hasConflict) {
-    booking.status = "payment_failed";
-    booking.paymentStatus = "failed";
-
+  if (slotConflict) {
     let refundInitiated = false;
 
     try {
       const razorpay = getRazorpay();
-      if (razorpay && booking.razorpayPaymentId) {
-        await razorpay.payments.refund(booking.razorpayPaymentId, {
-          amount: booking.amount,
+      if (razorpay && paymentId) {
+        await razorpay.payments.refund(paymentId, {
+          amount: currentBooking.amount,
           notes: {
             reason: "Slot no longer available",
-            bookingId: String(booking._id),
+            bookingId: String(currentBooking._id),
           },
         });
-        booking.paymentStatus = "refunded";
+
+        currentBooking.paymentStatus = "refunded";
+        await currentBooking.save();
         refundInitiated = true;
       }
     } catch (refundError) {
       console.error(
         "Refund failed for booking",
-        String(booking._id),
+        String(currentBooking._id),
         refundError.message,
       );
     }
-
-    await booking.save();
 
     const error = new Error(
       refundInitiated
@@ -539,22 +635,20 @@ const confirmPaidBooking = async ({ booking, business, service }) => {
     throw error;
   }
 
-  booking.status = "confirmed";
-  booking.paymentStatus = "paid";
-  booking.payoutStatus =
-    booking.providerPayoutAmount > 0 ? "available" : "not_required";
+  if (alreadyConfirmed) {
+    return currentBooking;
+  }
 
   try {
     const calendarResult = await createBookingCalendarEvent({
       business,
       service,
-      booking,
+      booking: currentBooking,
     });
 
-    booking.googleEventId = calendarResult.googleEventId || "";
-
-    booking.customerCalendarUrl =
-      calendarResult.customerCalendarUrl || booking.customerCalendarUrl;
+    currentBooking.googleEventId = calendarResult.googleEventId || "";
+    currentBooking.customerCalendarUrl =
+      calendarResult.customerCalendarUrl || currentBooking.customerCalendarUrl;
   } catch (calendarError) {
     console.error(
       "Google Calendar confirmation failed:",
@@ -562,24 +656,24 @@ const confirmPaidBooking = async ({ booking, business, service }) => {
     );
   }
 
-  await booking.save();
+  await currentBooking.save();
 
-  // The wallet utility should be idempotent for this booking.
+  // The wallet utility is idempotent for this booking.
   await createBookingPayoutTransaction({
-    booking,
-    description: `Booking payment from ${booking.customerName || "Customer"}`,
+    booking: currentBooking,
+    description: `Booking payment from ${currentBooking.customerName || "Customer"}`,
   });
 
   sendBookingNotification({
     business,
     service,
-    booking,
+    booking: currentBooking,
     type: "confirmed",
   }).catch((emailError) =>
     console.error("Booking confirmation email failed:", emailError.message),
   );
 
-  return booking;
+  return currentBooking;
 };
 
 // --------------------------------------------------
@@ -828,4 +922,4 @@ export const cancelPublicBookingPayment = async (req, res) => {
     });
   }
 };
-// this is public.controller.js
+
