@@ -763,10 +763,9 @@ export const getBookingStatus = async (req, res) => {
       });
     }
 
-    const booking = await Booking.findById(bookingId).populate(
-      "serviceId",
-      "name duration price",
-    );
+    const booking = await Booking.findById(bookingId)
+      .select("_id status paymentStatus")
+      .lean();
 
     if (!booking) {
       return res.status(404).json({
@@ -774,7 +773,13 @@ export const getBookingStatus = async (req, res) => {
       });
     }
 
-    return res.json({ booking });
+    return res.json({
+      booking: {
+        id: booking._id,
+        status: booking.status,
+        paymentStatus: booking.paymentStatus,
+      },
+    });
   } catch (error) {
     return res.status(500).json({
       message: "Server error",
