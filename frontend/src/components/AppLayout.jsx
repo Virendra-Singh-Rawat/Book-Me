@@ -162,8 +162,9 @@ export default function AppLayout({ children }) {
             </div>
           </div>
           <div className={s.footerRule}></div>
-          <div>
-            <div>
+          
+          <div className={s.footerBottom}>
+            <di className={s.footerLegalGroup}>
               <span className={s.footerCopyright}>
                 © 2026 BookMe. All rights reserved.
               </span>
@@ -176,7 +177,7 @@ export default function AppLayout({ children }) {
                   Terms of Service
                 </Link>
               </div>
-            </div>
+            </di>
           </div>
         </div>
 
