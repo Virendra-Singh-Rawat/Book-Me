@@ -8,6 +8,7 @@ export default function BookingSuccessPage() {
   const [searchParams] = useSearchParams();
   const bookingId = searchParams.get("booking_id");
   const slug = searchParams.get("slug");
+  const statusToken = searchParams.get("status_token");
   const [booking, setBooking] = useState(null);
   const [message, setMessage] = useState("Verifying your payment...");
 
@@ -15,15 +16,18 @@ export default function BookingSuccessPage() {
     let isCurrent = true;
 
     const loadBookingStatus = async () => {
-      if (!bookingId) {
+      if (!bookingId || !statusToken) {
         setMessage(
-          "We could not verify this payment because the booking ID is missing.",
+          "We could not verify this payment because the booking access details are missing.",
         );
         return;
       }
 
       try {
-        const { data } = await getBookingStatus({ booking_id: bookingId });
+        const { data } = await getBookingStatus({
+          booking_id: bookingId,
+          status_token: statusToken,
+        });
         if (!isCurrent) return;
 
         const currentBooking = data.booking;
@@ -60,7 +64,7 @@ export default function BookingSuccessPage() {
     return () => {
       isCurrent = false;
     };
-  }, [bookingId]);
+  }, [bookingId, statusToken]);
 
   return (
     <div className={s.container}>
