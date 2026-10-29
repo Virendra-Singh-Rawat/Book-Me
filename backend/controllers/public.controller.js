@@ -19,6 +19,11 @@ import { createBookingPayoutTransaction } from "../utils/wallet.js";
 // PUBLIC BUSINESS HELPERS
 // --------------------------------------------------
 
+const createBookingStatusToken = () => crypto.randomBytes(32).toString("hex");
+
+const hashBookingStatusToken = (token) =>
+  crypto.createHash("sha256").update(token).digest("hex");
+
 const getBusinessBySlug = async (slug) => {
   return User.findOne({ slug }).select("-password");
 };
@@ -282,6 +287,7 @@ export const verifyPublicBookingOtp = async (req, res) => {
 
 export const createPublicBooking = async (req, res) => {
   let createdBooking = null;
+  let statusToken;
 
   try {
     const {
@@ -401,6 +407,9 @@ export const createPublicBooking = async (req, res) => {
       },
     });
 
+    // Return the raw token once and store only its hash with the booking.
+    statusToken = createBookingStatusToken();
+
     // Reserve the slot and create the booking in one serialized transaction.
     createdBooking = await reserveBookingSlot({
       businessId: business._id,
@@ -424,6 +433,7 @@ export const createPublicBooking = async (req, res) => {
         currency,
         paymentStatus: amount > 0 ? "pending" : "not_required",
         status: amount > 0 ? "pending_payment" : "confirmed",
+        statusTokenHash: hashBookingStatusToken(statusToken),
         customerCalendarUrl,
       },
     });
@@ -463,6 +473,7 @@ export const createPublicBooking = async (req, res) => {
         message: "Booking confirmed.",
         booking: createdBooking,
         customerCalendarUrl: createdBooking.customerCalendarUrl,
+        statusToken,
       });
     }
 
@@ -486,6 +497,7 @@ export const createPublicBooking = async (req, res) => {
     return res.status(201).json({
       message: "Continue to payment.",
       bookingId: createdBooking._id,
+      statusToken,
       razorpayOrderId: order.id,
       amount: order.amount,
       currency: order.currency,
@@ -849,7 +861,7 @@ export const verifyPublicBookingPayment = async (req, res) => {
 
 export const getBookingStatus = async (req, res) => {
   try {
-    const { booking_id: bookingId } = req.query;
+    const { booking_id: bookingId, status_token: statusToken } = req.query;
 
     if (!bookingId || !mongoose.isValidObjectId(bookingId)) {
       return res.status(400).json({
@@ -857,13 +869,25 @@ export const getBookingStatus = async (req, res) => {
       });
     }
 
-    const booking = await Booking.findById(bookingId)
+    if (
+      typeof statusToken !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(statusToken)
+    ) {
+      return res.status(401).json({
+        message: "Booking access token is required.",
+      });
+    }
+
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      statusTokenHash: hashBookingStatusToken(statusToken),
+    })
       .select("_id status paymentStatus")
       .lean();
 
     if (!booking) {
       return res.status(404).json({
-        message: "Booking not found.",
+        message: "Booking not found or access token is invalid.",
       });
     }
 
@@ -922,4 +946,3 @@ export const cancelPublicBookingPayment = async (req, res) => {
     });
   }
 };
-
