@@ -6,20 +6,19 @@ import { sendOtpNotification } from "./bookingNotifications.js";
 const OTP_TTL_MINUTES = 10;
 const MAX_ATTEMPTS = 5;
 
-const normalizeEmail = (email = "") => {
-  return email.toLocaleLowerCase().trim();
-};
-
+const normalizeEmail = (email = "") => email.toLowerCase().trim();
 const createCode = () => crypto.randomInt(100000, 1000000).toString();
 
 export const requestEmailOtp = async ({ email, purpose }) => {
   const normalizedEmail = normalizeEmail(email);
+
   if (!normalizedEmail) {
     throw new Error("Email is required");
   }
+
   const code = createCode();
   const codeHash = await bcrypt.hash(code, 10);
-  const expireAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
 
   await EmailOtp.deleteMany({
     email: normalizedEmail,
@@ -50,6 +49,7 @@ export const verifyEmailOtp = async ({
   consume = false,
 }) => {
   const normalizedEmail = normalizeEmail(email);
+
   if (!normalizedEmail || !code) {
     return {
       verified: false,
@@ -57,11 +57,12 @@ export const verifyEmailOtp = async ({
     };
   }
 
+  const now = new Date();
   const record = await EmailOtp.findOne({
     email: normalizedEmail,
     purpose,
     consumeAt: null,
-    expireAt: { $gt: new Date() },
+    expiresAt: { $gt: now },
   }).sort({ createdAt: -1 });
 
   if (!record) {
@@ -78,17 +79,46 @@ export const verifyEmailOtp = async ({
   const isMatch = await bcrypt.compare(String(code).trim(), record.codeHash);
 
   if (!isMatch) {
-    record.attempts += 1;
-    await record.save();
-    return {
-      verified: false,
-      reason: "Invalid OTP",
-    };
+    const updatedRecord = await EmailOtp.findOneAndUpdate(
+      {
+        _id: record._id,
+        consumeAt: null,
+        expiresAt: { $gt: new Date() },
+        attempts: { $lt: MAX_ATTEMPTS },
+      },
+      { $inc: { attempts: 1 } },
+      { new: true },
+    );
+
+    if (!updatedRecord) {
+      return {
+        verified: false,
+        reason: "OTP is no longer valid. Request a new code.",
+      };
+    }
+
+    return { verified: false, reason: "Invalid OTP" };
   }
 
   if (consume) {
-    record.consumeAt = new Date();
-    await record.save();
+    const consumedRecord = await EmailOtp.findOneAndUpdate(
+      {
+        _id: record._id,
+        consumeAt: null,
+        expiresAt: { $gt: new Date() },
+        attempts: { $lt: MAX_ATTEMPTS },
+      },
+      { $set: { consumeAt: new Date() } },
+      { new: true },
+    );
+
+    if (!consumedRecord) {
+      return {
+        verified: false,
+        reason: "OTP is no longer valid. Request a new code.",
+      };
+    }
   }
+
   return { verified: true, email: normalizedEmail };
 };
