@@ -17,6 +17,33 @@ const maskAccountNumber = (accountNumber = "") => {
   return digits.slice(-4);
 };
 
+const getAvailableBalanceInSession = async (userId, session) => {
+  const rows = await WalletTransaction.aggregate([
+    { $match: { userId } },
+    {
+      $group: {
+        _id: "$type",
+        total: { $sum: "$amount" },
+      },
+    },
+  ]).session(session);
+
+  const totals = rows.reduce((acc, row) => {
+    acc[row._id] = row.total;
+    return acc;
+  }, {});
+
+  return Math.max(
+    0,
+    (totals.booking_payout || 0) -
+      (totals.withdrawal_hold || 0) +
+      (totals.withdrawal_reversal || 0),
+  );
+};
+
+const httpError = (statusCode, message) =>
+  Object.assign(new Error(message), { statusCode });
+
 /**
  * Retrieves an overview of the user's payments including payout details,
  * total wallet balance summary, and recent transactions/withdrawals.
@@ -27,6 +54,7 @@ const maskAccountNumber = (accountNumber = "") => {
 export const getPaymentOverview = async (req, res) => {
   try {
     const userId = toObjectId(req.user.id);
+
     const [user, summary, transactions, withdrawals] = await Promise.all([
       User.findById(userId).select("payoutDetails"),
       getWalletSummary(userId),
@@ -34,14 +62,17 @@ export const getPaymentOverview = async (req, res) => {
       Withdrawal.find({ userId }).sort({ createdAt: -1 }).limit(10),
     ]);
 
-    res.json({
+    return res.json({
       payoutDetails: user?.payoutDetails || {},
       wallet: summary,
       transactions,
       withdrawals,
     });
   } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
   }
 };
 
@@ -58,11 +89,9 @@ export const updatePayoutDetails = async (req, res) => {
       req.body;
 
     if (!accountHolderName || (!accountNumber && !upiId)) {
-      return res
-        .status(400)
-        .json({
-          message: "Account holder and a bank account or UPI ID are required",
-        });
+      return res.status(400).json({
+        message: "Account holder and a bank account or UPI ID are required",
+      });
     }
 
     const payoutDetails = {
@@ -81,12 +110,19 @@ export const updatePayoutDetails = async (req, res) => {
       { new: true },
     ).select("payoutDetails");
 
-    res.json({
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.json({
       message: "Payout details saved",
       payoutDetails: user.payoutDetails,
     });
   } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
   }
 };
 
@@ -99,49 +135,104 @@ export const updatePayoutDetails = async (req, res) => {
  * @param {Object} res - Express response object.
  */
 export const requestWithdrawal = async (req, res) => {
+  const amountInput = Number(req.body.amount);
+
+  if (!Number.isFinite(amountInput)) {
+    return res.status(400).json({
+      message: "A valid withdrawal amount is required",
+    });
+  }
+
+  const amount = Math.round(amountInput);
+
+  if (!Number.isSafeInteger(amount) || amount < 100) {
+    return res.status(400).json({
+      message: "Withdrawal amount must be at least 100",
+    });
+  }
+
+  const userId = toObjectId(req.user.id);
+  const session = await mongoose.startSession();
+  let withdrawal;
+
   try {
-    const userId = toObjectId(req.user.id);
-    const amount = Math.round(Number(req.body.amount || 0));
-    const user = await User.findById(userId).select("payoutDetails");
+    await session.withTransaction(async () => {
+      withdrawal = null;
 
-    if (!user?.payoutDetails?.isComplete) {
-      return res
-        .status(400)
-        .json({ message: "Add payout details before requesting a withdrawal" });
-    }
+      // This shared per-user write serializes concurrent withdrawal
+      // transactions. strict:false allows this internal version field
+      // without adding it to the User schema.
+      const lockResult = await User.updateOne(
+        { _id: userId },
+        { $inc: { walletWithdrawalVersion: 1 } },
+        { session, strict: false },
+      );
 
-    const summary = await getWalletSummary(userId);
-    if (!amount || amount < 100) {
-      return res
-        .status(400)
-        .json({ message: "Withdrawal amount must be at least 100" });
-    }
+      if (lockResult.matchedCount === 0) {
+        throw httpError(404, "User not found");
+      }
 
-    if (amount > summary.available) {
-      return res
-        .status(400)
-        .json({ message: "Withdrawal amount exceeds available balance" });
-    }
+      const user = await User.findById(userId)
+        .select("payoutDetails")
+        .session(session);
 
-    const withdrawal = await Withdrawal.create({
-      userId,
-      amount,
-      payoutSnapshot: user.payoutDetails,
+      if (!user?.payoutDetails?.isComplete) {
+        throw httpError(
+          400,
+          "Add payout details before requesting a withdrawal",
+        );
+      }
+
+      const availableBalance = await getAvailableBalanceInSession(
+        userId,
+        session,
+      );
+
+      if (amount > availableBalance) {
+        throw httpError(400, "Withdrawal amount exceeds available balance");
+      }
+
+      [withdrawal] = await Withdrawal.create(
+        [
+          {
+            userId,
+            amount,
+            payoutSnapshot: user.payoutDetails,
+          },
+        ],
+        { session },
+      );
+
+      await WalletTransaction.create(
+        [
+          {
+            userId,
+            withdrawalId: withdrawal._id,
+            type: "withdrawal_hold",
+            amount,
+            status: "pending",
+            description: "Withdrawal requested",
+          },
+        ],
+        { session },
+      );
     });
 
-    await WalletTransaction.create({
-      userId,
-      withdrawalId: withdrawal._id,
-      type: "withdrawal_hold",
-      amount,
-      status: "pending",
-      description: "Withdrawal requested",
+    return res.status(201).json({
+      message: "Withdrawal requested",
+      withdrawal,
     });
-
-    res.status(201).json({ message: "Withdrawal requested", withdrawal });
   } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message });
+    }
+
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  } finally {
+    await session.endSession();
   }
 };
 
-// backend/controllers/payment.controller.js
