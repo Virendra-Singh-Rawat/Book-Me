@@ -48,6 +48,17 @@ const walletTransactionSchema = new mongoose.Schema(
 );
 
 walletTransactionSchema.index(
+  { withdrawalId: 1, type: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      withdrawalId: { $exists: true },
+      type: "withdrawal_reversal",
+    },
+  },
+);
+
+walletTransactionSchema.index(
   { bookingId: 1, type: 1 },
   {
     unique: true,
