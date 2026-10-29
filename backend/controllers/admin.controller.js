@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import Booking from "../models/booking.model.js";
 import User from "../models/user.model.js";
 import WalletTransaction from "../models/walletTransaction.model.js";
@@ -225,55 +226,96 @@ export const getAdminDashboard = async (req, res) => {
 };
 
 export const updateWithdrawalStatus = async (req, res) => {
+  const { status, adminNote } = req.body;
+  const allowedStatuses = ["pending", "processing", "paid", "rejected"];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({ message: "Invalid withdrawal status" });
+  }
+
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid withdrawal ID" });
+  }
+
+  const session = await mongoose.startSession();
+  let updatedWithdrawal;
+
   try {
-    const { status, adminNote } = req.body;
-    const allowedStatuses = ["pending", "processing", "paid", "rejected"];
+    await session.withTransaction(async () => {
+      updatedWithdrawal = null;
 
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({ message: "Invalid withdrawal status" });
-    }
+      // Only a non-terminal withdrawal can transition. The status change and
+      // reversal creation commit or roll back together.
+      const withdrawal = await Withdrawal.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          status: { $nin: terminalWithdrawalStatuses },
+        },
+        {
+          $set: {
+            status,
+            ...(adminNote !== undefined ? { adminNote } : {}),
+          },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        },
+      );
 
-    const withdrawal = await Withdrawal.findById(req.params.id);
+      if (!withdrawal) {
+        const current = await Withdrawal.findById(req.params.id).session(
+          session,
+        );
 
-    if (!withdrawal) {
-      return res.status(404).json({ message: "Withdrawal not found" });
-    }
+        if (!current) {
+          throw Object.assign(new Error("Withdrawal not found"), {
+            statusCode: 404,
+          });
+        }
 
-    if (terminalWithdrawalStatuses.includes(withdrawal.status)) {
-      return res.status(400).json({
-        message: `Withdrawal is already ${withdrawal.status} and cannot be changed`,
-      });
-    }
-
-    if (status === "rejected") {
-      const existingReversal = await WalletTransaction.findOne({
-        withdrawalId: withdrawal._id,
-        type: "withdrawal_reversal",
-      });
-
-      if (!existingReversal) {
-        await WalletTransaction.create({
-          userId: withdrawal.userId,
-          withdrawalId: withdrawal._id,
-          type: "withdrawal_reversal",
-          amount: withdrawal.amount,
-          status: "reversed",
-          description: "Withdrawal rejected and funds returned",
-        });
+        throw Object.assign(
+          new Error(
+            `Withdrawal is already ${current.status} and cannot be changed`,
+          ),
+          { statusCode: 400 },
+        );
       }
-    }
 
-    withdrawal.status = status;
+      if (status === "rejected") {
+        await WalletTransaction.updateOne(
+          {
+            withdrawalId: withdrawal._id,
+            type: "withdrawal_reversal",
+          },
+          {
+            $setOnInsert: {
+              userId: withdrawal.userId,
+              withdrawalId: withdrawal._id,
+              type: "withdrawal_reversal",
+              amount: withdrawal.amount,
+              status: "reversed",
+              description: "Withdrawal rejected and funds returned",
+            },
+          },
+          {
+            upsert: true,
+            session,
+            runValidators: true,
+          },
+        );
+      }
 
-    if (adminNote !== undefined) {
-      withdrawal.adminNote = adminNote;
-    }
-
-    await withdrawal.save();
+      updatedWithdrawal = withdrawal;
+    });
 
     const [summary, populatedWithdrawal] = await Promise.all([
       getAdminSummary(),
-      withdrawal.populate("userId", "name email businessName"),
+      Withdrawal.findById(updatedWithdrawal._id).populate(
+        "userId",
+        "name email businessName",
+      ),
     ]);
 
     return res.json({
@@ -282,10 +324,22 @@ export const updateWithdrawalStatus = async (req, res) => {
       summary,
     });
   } catch (error) {
-    return res
-      .status(500)
-      .json({ message: "Server error", error: error.message });
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message });
+    }
+
+    if (error.code === 11000) {
+      return res.status(409).json({
+        message: "This withdrawal reversal has already been recorded.",
+      });
+    }
+
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  } finally {
+    await session.endSession();
   }
 };
 
-// this is backend/controllers/admin.controller.js
