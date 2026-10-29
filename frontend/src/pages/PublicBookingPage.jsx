@@ -387,6 +387,7 @@ export default function PublicBookingPage() {
 
           const query = new URLSearchParams({
             booking_id: orderData.bookingId,
+            status_token: orderData.statusToken,
             slug,
           });
           navigate(`/booking/success?${query.toString()}`);
@@ -405,6 +406,7 @@ export default function PublicBookingPage() {
 
           const query = new URLSearchParams({
             booking_id: orderData.bookingId,
+            status_token: orderData.statusToken,
             slug,
           });
           navigate(`/booking/cancelled?${query.toString()}`);
