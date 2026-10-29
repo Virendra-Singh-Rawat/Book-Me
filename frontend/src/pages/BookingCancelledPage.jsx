@@ -8,6 +8,7 @@ export default function BookingCancelledPage() {
   const [searchParams] = useSearchParams();
   const bookingId = searchParams.get("booking_id");
   const slug = searchParams.get("slug");
+  const statusToken = searchParams.get("status_token");
 
   const [booking, setBooking] = useState(null);
   const [message, setMessage] = useState("Checking your booking status...");
@@ -16,9 +17,9 @@ export default function BookingCancelledPage() {
     let isCurrent = true;
 
     const checkBookingStatus = async () => {
-      if (!bookingId) {
+      if (!bookingId || !statusToken) {
         setMessage(
-          "We could not check the payment because the booking ID is missing.",
+          "We could not check the payment because the booking access details are missing.",
         );
         return;
       }
@@ -30,6 +31,7 @@ export default function BookingCancelledPage() {
 
         const { data } = await getBookingStatus({
           booking_id: bookingId,
+          status_token: statusToken,
         });
 
         if (!isCurrent) return;
@@ -75,7 +77,7 @@ export default function BookingCancelledPage() {
     return () => {
       isCurrent = false;
     };
-  }, [bookingId]);
+  }, [bookingId, statusToken]);
 
   const isConfirmed =
     booking?.status === "confirmed" &&
