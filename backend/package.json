@@ -17,8 +17,7 @@
     "googleapis": "^186.0.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.11.2",
-    "razorpay": "^2.9.8",
-    "stripe": "^23.0.0"
+    "razorpay": "^2.9.8"
   },
   "devDependencies": {
     "eslint": "^10.12.0",
