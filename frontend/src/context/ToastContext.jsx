@@ -10,7 +10,7 @@ import { BadgeCheck, AlertCircle } from "lucide-react";
 
 const ToastContext = createContext(null);
 
-export const UserToast = () => {
+export const UseToast = () => {
   const context = useContext(ToastContext);
 
   if (!context) {
@@ -61,7 +61,7 @@ export const ToastProvider = ({ children }) => {
       <div
         role="status"
         aria-live="polite"
-        className={`fixed bottom-6 right-6 z-[9999] flex items-center gap-3 rounded-xl px-5 py-3.5 shadow-lg transition-all duration-300 transform
+        className={`fixed bottom-6 right-6 z-9999 flex items-center gap-3 rounded-xl px-5 py-3.5 shadow-lg transition-all duration-300 transform
           ${
             toast.show
               ? "translate-y-0 opacity-100"
